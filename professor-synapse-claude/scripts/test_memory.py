@@ -673,5 +673,133 @@ class VerifyLoop(MemTest):
             self.cli("reconfirm", "--id", rid, "--confidence", "high")  # dropped
 
 
+class Dream(MemTest):
+    """Consolidation: dream surfaces dense clusters + persona material; consolidate
+    folds atoms under an insight (kept as evidence, one hop behind the summary)."""
+
+    def rec(self, text, kind="fact", agent="a", **kw):
+        argv = ["--agent", agent, "record", "--kind", kind, "--text", text]
+        for k, v in kw.items():
+            argv += [f"--{k}", *(v if isinstance(v, list) else [v])]
+        self.cli(*argv)
+        return self.id_by_text(text)
+
+    def consolidated_into(self, rid):
+        con = self.db()
+        row = con.execute("SELECT consolidated_into FROM record WHERE id=?", (rid,)).fetchone()
+        con.close()
+        return row[0] if row else None
+
+    def cluster_of_three(self):
+        a = self.rec("user prefers dark mode", tags="ui")
+        b = self.rec("user prefers terse replies", tags="style")
+        c = self.rec("user prefers async comms", tags="comms")
+        self.cli("reinforce", "--ids", a, b, c)  # wire them into one cluster
+        return a, b, c
+
+    def test_dream_surfaces_dense_cluster(self):
+        a, b, c = self.cluster_of_three()
+        clusters = self.cli_json("dream")["clusters"]
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["size"], 3)
+        self.assertEqual({m["id"] for m in clusters[0]["members"]}, {a, b, c})
+
+    def test_dream_ignores_sparse_pairs(self):
+        a = self.rec("lonely one")
+        b = self.rec("lonely two")
+        self.cli("reinforce", "--ids", a, b)  # a pair is below DREAM_MIN_CLUSTER (3)
+        self.assertEqual(self.cli_json("dream")["clusters"], [])
+
+    def test_dream_persona_surfaces_high_confidence_facts(self):
+        self.rec("user founded Synaptic Labs", confidence="high")
+        self.rec("a low-confidence guess", confidence="low")
+        self.rec("a plain note", kind="note")
+        persona = self.cli_json("dream")["persona"]
+        texts = [f["text"] for f in persona["high_confidence_facts"]]
+        self.assertEqual(texts, ["user founded Synaptic Labs"])
+        self.assertEqual(persona["fact_count"], 1)
+        self.assertIn("profile", persona)
+
+    def test_consolidate_creates_insight_and_folds_atoms(self):
+        a, b, c = self.cluster_of_three()
+        out = self.cli("--agent", "a", "consolidate", "--from", a, b, c,
+                       "--text", "user prefers a minimal dark async UX",
+                       "--tags", "preferences", "--confidence", "high")
+        self.assertIn("consolidated 3", out)
+        insight = self.id_by_text("user prefers a minimal dark async UX")
+        con = self.db()
+        kind = con.execute("SELECT kind FROM record WHERE id=?", (insight,)).fetchone()[0]
+        con.close()
+        self.assertEqual(kind, "insight")
+        for atom in (a, b, c):
+            self.assertEqual(self.consolidated_into(atom), insight)
+        self.assertIsNone(self.consolidated_into(insight))  # the summary isn't itself folded
+
+    def test_insight_is_primary_hit_and_atoms_drill_down(self):
+        a, b, c = self.cluster_of_three()
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c,
+                 "--text", "user prefers a minimal dark async UX", "--tags", "preferences")
+        # 'dark' appears in both the summary and a folded atom: the insight leads,
+        # the atoms surface one hop behind as evidence.
+        hits = self.cli_json("recall", "--query", "dark", "--no-reinforce")["candidates"]
+        self.assertEqual(hits[0]["kind"], "insight", "the summary is the primary hit")
+        self.assertEqual(hits[0]["why"], "matches dark")
+        whys = {h["id"]: h["why"] for h in hits}
+        self.assertIn(a, whys)
+        self.assertEqual(whys[a], "linked to a match", "folded atom surfaces as evidence")
+
+    def test_folded_atom_hidden_from_primary_recall(self):
+        a, b, c = self.cluster_of_three()
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c,
+                 "--text", "user prefers a minimal dark UX", "--tags", "preferences")
+        # 'terse' lives only in a folded atom and NOT in the summary -> no primary hit,
+        # and nothing else matched to pull it in via the graph.
+        self.assertEqual(self.cli_json("recall", "--query", "terse", "--no-reinforce")["candidates"], [],
+                         "a folded atom is not a primary recall hit on its own words")
+
+    def test_consolidated_cluster_not_re_surfaced_by_dream(self):
+        a, b, c = self.cluster_of_three()
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c, "--text", "rolled up")
+        self.assertEqual(self.cli_json("dream")["clusters"], [],
+                         "an already-consolidated cluster is not proposed again")
+
+    def test_scan_skips_consolidated_atoms(self):
+        a, b, c = self.cluster_of_three()
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c, "--text", "rolled up")
+        # age a folded atom into the chopping-block window; it must not be flagged —
+        # it is retained as evidence under its summary.
+        con = self.db()
+        con.execute("UPDATE record SET last_used=? WHERE id=?",
+                    ("2020-01-01T00:00:00+00:00", a))
+        con.commit()
+        con.close()
+        flagged = [x["id"] for x in self.cli_json("scan")["stale_longterm"]]
+        self.assertNotIn(a, flagged)
+
+    def test_consolidate_rejects_bad_and_double(self):
+        a, b, c = self.cluster_of_three()
+        with self.assertRaises(SystemExit):  # unknown id
+            self.cli("consolidate", "--from", a, "m-deadbeef", "--text", "x")
+        with self.assertRaises(SystemExit):  # fewer than two
+            self.cli("consolidate", "--from", a, "--text", "x")
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c, "--text", "rolled up")
+        with self.assertRaises(SystemExit):  # already consolidated
+            self.cli("consolidate", "--from", a, b, "--text", "again")
+
+    def test_consolidate_logs_event(self):
+        a, b, c = self.cluster_of_three()
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c, "--text", "rolled up")
+        actions = [r for r in self.cli_json("export")["changelog"] if r["action"] == "consolidate"]
+        self.assertEqual(len(actions), 1)
+        self.assertIn("folded 3", actions[0]["summary"])
+
+    def test_consolidate_survives_doctor(self):
+        a, b, c = self.cluster_of_three()
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c, "--text", "rolled up")
+        doc = self.cli_json("doctor")
+        self.assertEqual(doc["integrity_check"], "ok")
+        self.assertEqual(doc["invariant_issues"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
