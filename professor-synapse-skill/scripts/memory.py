@@ -27,6 +27,8 @@ Verbs (run `python3 memory.py <verb> --help` for options):
              --query is ranked full-text search (FTS5, with a LIKE fallback).
   brief      One-shot prefetch: profile + active items + due long-term items,
              plus --query matches. The start-of-session recall in one call.
+  dream      Surface dense graph clusters to consolidate + persona material (read-only).
+  consolidate Fold a cluster of atoms into a higher-altitude insight.
   agents     List every agent that has touched memory, with counts.
   validate   Check memory.json; --fix applies safe mechanical repairs.
   doctor     Check long-term db integrity.
@@ -62,7 +64,7 @@ except Exception:
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 MEM_DIR = SKILL_ROOT / "memory"
 ITEM_STATUS = {"open", "done"}
-RECORD_KINDS = {"item", "decision", "note", "fact", "lesson"}
+RECORD_KINDS = {"item", "decision", "note", "fact", "lesson", "insight"}
 RECORD_STATUS = {"open", "done", "deferred", "dropped"}
 CONFIDENCE_LEVELS = {"high", "medium", "low"}
 # Optional fusion nudge by confidence (applied multiplicatively when present).
@@ -85,7 +87,10 @@ W_RECENCY = 0.5                  # weight of the recency ranking (secondary sign
 # source/verify/unknowns (the confidence basis) are searchable but weighted modestly;
 # verify a touch higher so "how do I confirm X" finds the upgrade path.
 BM25_WEIGHTS = (0.0, 1.0, 3.0, 3.0, 1.0, 2.0, 1.5, 3.0, 1.0, 1.5, 1.0)
-KIND_WEIGHT = {"fact": 1.3, "lesson": 1.25, "decision": 1.2, "note": 1.0, "item": 1.0}
+# insight = a synthesised roll-up of a cluster (memory's "dream"); it is the highest-
+# signal recall hit, edging out the atoms it consolidated.
+KIND_WEIGHT = {"insight": 1.35, "fact": 1.3, "lesson": 1.25, "decision": 1.2,
+               "note": 1.0, "item": 1.0}
 
 # No-query recall fallback: when a summon/recall arrives with no query terms (or the
 # query matches nothing), surface this many of the agent's most recent records,
@@ -102,6 +107,14 @@ W_GRAPH = 0.6               # fusion weight of the graph-affinity ranking (cf. W
 GRAPH_SEEDS = 5             # how many top text hits seed spreading activation
 GRAPH_FANOUT = 20           # cap on neighbours pulled in per query
 GRAPH_MIN_AFFINITY = 0.1    # ignore trivially weak pulled-in neighbours
+
+# Dream (consolidation) tuning. `dream` surfaces dense graph clusters worth rolling up
+# into a higher-altitude `insight`; `consolidate` folds a cluster's atoms under one,
+# marking them consolidated (kept as evidence, one hop behind the summary in recall).
+DREAM_EDGE_FLOOR = 0.5      # min decayed edge weight for two records to count as intra-cluster
+DREAM_MIN_CLUSTER = 3       # smallest cluster worth proposing for consolidation
+DREAM_MAX_CLUSTERS = 10     # cap on clusters surfaced per dream
+DREAM_PERSONA_FACTS = 12    # high-confidence facts surfaced for persona (profile) re-synthesis
 
 # Write-time similarity check ("am I about to duplicate/contradict something?").
 # Surfaces existing records resembling a proposed write so the agent can decide
@@ -341,7 +354,8 @@ CREATE TABLE IF NOT EXISTS record (
     confidence  TEXT,
     verify      TEXT,
     unknowns    TEXT,
-    last_used   TEXT
+    last_used   TEXT,
+    consolidated_into TEXT
 );
 """
 EDGE_DDL = """
@@ -370,7 +384,7 @@ CREATE TABLE IF NOT EXISTS changelog (
 RECORD_COLUMNS = ("id", "agent", "kind", "type", "text", "people", "tags", "owner",
                   "due", "status", "source", "created_at", "recorded_at", "reason",
                   "rationale", "goal", "outcome", "constraints", "confidence",
-                  "verify", "unknowns", "last_used")
+                  "verify", "unknowns", "last_used", "consolidated_into")
 
 
 def _migrate_record_schema(con):
@@ -382,7 +396,8 @@ def _migrate_record_schema(con):
     if not row:
         return
     cols = {r[1] for r in con.execute("PRAGMA table_info(record)")}
-    for c in ("goal", "outcome", "constraints", "confidence", "verify", "unknowns", "last_used"):
+    for c in ("goal", "outcome", "constraints", "confidence", "verify", "unknowns",
+              "last_used", "consolidated_into"):
         if c not in cols:
             con.execute(f"ALTER TABLE record ADD COLUMN {c} TEXT")
     if "kind IN ('item','decision','note','fact')" in (row[0] or ""):
@@ -481,6 +496,20 @@ def _connectivity(con, now=None):
         agg[a] = agg.get(a, 0.0) + dw
         agg[b] = agg.get(b, 0.0) + dw
     return agg
+
+
+def _consolidated_ids(con, ids):
+    """Of the given ids, those folded under an insight (`consolidated_into` set). They
+    are kept as evidence but held out of *primary* recall — they resurface only one hop
+    behind their summary via spreading activation."""
+    ids = [x for x in dict.fromkeys(ids)]
+    if not ids:
+        return set()
+    qs = ",".join("?" for _ in ids)
+    rows = con.execute(
+        f"SELECT id FROM record WHERE id IN ({qs}) "
+        "AND consolidated_into IS NOT NULL AND consolidated_into != ''", ids).fetchall()
+    return {r[0] for r in rows}
 
 
 def log_event(con, agent, action, item_id, summary):
@@ -647,7 +676,7 @@ def cmd_scan(root, args):
     stale_lt = []
     for rid, last_used, recorded_at, created_at in con.execute(
         "SELECT id,last_used,recorded_at,created_at FROM record "
-        f"WHERE status != 'dropped'{clause}", a):
+        f"WHERE status != 'dropped' AND COALESCE(consolidated_into,'') = ''{clause}", a):
         stamp = last_used or recorded_at or created_at
         if not stamp or not _is_iso(stamp):
             continue
@@ -664,6 +693,7 @@ def cmd_scan(root, args):
     unverified = []
     for rid, conf, verify, last_used in con.execute(
         "SELECT id,confidence,verify,last_used FROM record WHERE status != 'dropped' "
+        "AND COALESCE(consolidated_into,'') = '' "
         f"AND verify IS NOT NULL AND verify != '' AND confidence IN ('low','medium'){clause}", a):
         unverified.append({"id": rid, "confidence": conf, "verify": verify,
                            "last_used": last_used, "affinity": round(conn_map.get(rid, 0.0), 4)})
@@ -674,6 +704,198 @@ def cmd_scan(root, args):
                       "stale": stale, "duplicates": dupes, "count": len(items),
                       "longterm_stale_days": LONGTERM_STALE_DAYS,
                       "stale_longterm": stale_lt, "unverified": unverified}, indent=2))
+
+
+# Compact English stopword set for keyword suggestion (dream). Not exhaustive — just
+# enough to keep suggested keywords substantive; the agent curates the final set.
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
+    "with", "at", "by", "from", "as", "is", "are", "was", "were", "be", "been", "being",
+    "it", "its", "this", "that", "these", "those", "i", "you", "he", "she", "they", "we",
+    "them", "his", "her", "their", "our", "your", "my", "me", "us", "do", "does", "did",
+    "done", "so", "not", "no", "yes", "can", "will", "would", "should", "could", "may",
+    "might", "must", "have", "has", "had", "about", "into", "over", "than", "too", "very",
+    "just", "also", "more", "most", "some", "any", "all", "each", "who", "what", "when",
+    "where", "which", "how", "user", "users", "prefers", "prefer", "preferred",
+}
+
+
+def _suggest_keywords(members, limit=12):
+    """Pull salient keywords from a cluster's members (their tags + text + constraints)
+    to seed an `insight`'s recall tags, so the folded topics still surface on their own
+    words. Existing tags are always kept (already-curated recall keys); the rest are the
+    most frequent stopword-filtered words across the members. A starting point for the
+    agent to curate — not an authority."""
+    from collections import Counter
+    counts = Counter()
+    kept = []  # curated tags, kept regardless of frequency
+    for m in members:
+        for t in (m.get("tags") or []):
+            tl = t.strip().lower()
+            if tl and tl not in kept:
+                kept.append(tl)
+        blob = " ".join([m.get("text") or ""] + list(m.get("constraints") or []))
+        for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", blob.lower()):
+            if w not in _STOPWORDS:
+                counts[w] += 1
+    out = list(kept)
+    for w, _n in counts.most_common():
+        if len(out) >= limit:
+            break
+        if w not in out:
+            out.append(w)
+    return out[:limit]
+
+
+def _clusters(con, agent=None, now=None):
+    """Dense neighbourhoods in the co-recall graph worth rolling up into an `insight`.
+    Union-find over edges whose decayed weight clears DREAM_EDGE_FLOOR, restricted to
+    live records (non-dropped and not already consolidated). Returns clusters of at
+    least DREAM_MIN_CLUSTER members, densest first (density = summed intra-cluster
+    decayed weight)."""
+    now = now or datetime.now(timezone.utc)
+    clause = " AND agent = ?" if agent else ""
+    a = (agent,) if agent else ()
+    eligible = {}
+    for rid, ag, kind, text, tags, conf, constraints in con.execute(
+        "SELECT id,agent,kind,text,tags,confidence,constraints FROM record "
+        f"WHERE status != 'dropped' AND COALESCE(consolidated_into,'') = ''{clause}", a):
+        eligible[rid] = {"id": rid, "agent": ag, "kind": kind, "text": text,
+                         "tags": _json_list(tags), "confidence": conf,
+                         "constraints": _json_list(constraints)}
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        parent[find(x)] = find(y)
+
+    intra = []  # (a, b, decayed_weight) for edges inside the eligible set
+    for ea, eb, w, upd in con.execute("SELECT a,b,weight,updated_at FROM edge"):
+        if ea not in eligible or eb not in eligible:
+            continue
+        dw = _decay(w, upd, now)
+        if dw < DREAM_EDGE_FLOOR:
+            continue
+        union(ea, eb)
+        intra.append((ea, eb, dw))
+    groups = {}
+    for rid in eligible:
+        groups.setdefault(find(rid), []).append(rid)
+    density = {}
+    for ea, _eb, dw in intra:
+        root = find(ea)
+        density[root] = density.get(root, 0.0) + dw
+    out = []
+    for root, ids in groups.items():
+        if len(ids) < DREAM_MIN_CLUSTER:
+            continue
+        members = [eligible[i] for i in ids]
+        out.append({"size": len(ids), "density": round(density.get(root, 0.0), 4),
+                    "suggested_keywords": _suggest_keywords(members),
+                    "members": members})
+    out.sort(key=lambda c: c["density"], reverse=True)
+    return out[:DREAM_MAX_CLUSTERS]
+
+
+def _persona_material(con, agent=None):
+    """High-confidence facts that feed a persona (profile) re-synthesis, newest first."""
+    clause = " AND agent = ?" if agent else ""
+    a = (agent,) if agent else ()
+    rows = con.execute(
+        "SELECT id,agent,text,tags,people FROM record "
+        "WHERE kind='fact' AND confidence='high' AND status != 'dropped' "
+        f"AND COALESCE(consolidated_into,'') = ''{clause} "
+        "ORDER BY recorded_at DESC LIMIT ?", (*a, DREAM_PERSONA_FACTS)).fetchall()
+    return [{"id": r[0], "agent": r[1], "text": r[2],
+             "tags": _json_list(r[3]), "people": _json_list(r[4])} for r in rows]
+
+
+def cmd_dream(root, args):
+    """Read-only consolidation pass — memory's 'sleep'. Surfaces dense graph clusters
+    to roll up into an `insight`, plus the high-confidence facts and current profile to
+    re-synthesise the persona. The agent reasons over what comes back, then calls
+    `consolidate` (to fold a cluster) and/or `profile` (to refresh the persona).
+    Writes nothing itself."""
+    con = connect_db(root)
+    clusters = _clusters(con, args.agent)
+    persona_facts = _persona_material(con, args.agent)
+    con.close()
+    data = load_working(root)
+    print(json.dumps({
+        "clusters": clusters,
+        "persona": {"profile": data["profile"],
+                    "high_confidence_facts": persona_facts,
+                    "fact_count": len(persona_facts)},
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_consolidate(root, args):
+    """Fold a cluster of atoms into a new higher-altitude `insight` (memory's L2/L3
+    roll-up). Creates the insight, links it to each source atom so they stay reachable
+    one hop behind it, and marks the atoms consolidated — held out of primary recall
+    but kept as evidence. The summary becomes the hot recall hit; the atoms are its
+    trail back to the ground truth. The insight inherits the union of the atoms' tags
+    and people (plus any keywords passed via --tags) so the folded topics still surface
+    on their own words."""
+    kind = args.kind or "insight"
+    if kind not in RECORD_KINDS:
+        sys.exit(f"--kind must be one of {sorted(RECORD_KINDS)}")
+    ids = [x for x in dict.fromkeys(args.from_ids or [])]
+    if len(ids) < 2:
+        sys.exit("--from needs at least two record ids to consolidate")
+    con = connect_db(root)
+    # Inherit the atoms' curated recall keys so the folded topics still surface: the
+    # insight's tags/people are the agent-supplied ones (major keywords pulled from the
+    # originals — dream suggests them) plus the union of every source atom's tags/people.
+    inherited_tags, inherited_people = [], []
+    for sid in ids:
+        row = con.execute(
+            "SELECT status, consolidated_into, tags, people FROM record WHERE id=?",
+            (sid,)).fetchone()
+        if row is None:
+            con.close()
+            sys.exit(f"unknown record id: {sid}")
+        if row[0] == "dropped":
+            con.close()
+            sys.exit(f"record {sid} is dropped; resurface it or leave it out")
+        if row[1]:
+            con.close()
+            sys.exit(f"record {sid} is already consolidated (into {row[1]})")
+        for t in _json_list(row[2]):
+            if t not in inherited_tags:
+                inherited_tags.append(t)
+        for p in _json_list(row[3]):
+            if p not in inherited_people:
+                inherited_people.append(p)
+    final_tags = list(dict.fromkeys((args.tags or []) + inherited_tags))
+    final_people = list(dict.fromkeys((args.people or []) + inherited_people))
+    rid = new_id()
+    now_ts = utc_now()
+    con.execute(
+        "INSERT INTO record"
+        "(id,agent,kind,type,text,people,tags,owner,due,status,source,created_at,"
+        "recorded_at,reason,rationale,goal,outcome,constraints,confidence,verify,unknowns,last_used)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rid, args.agent or DEFAULT_AGENT, kind, args.type, args.text,
+         json.dumps(final_people), json.dumps(final_tags),
+         None, None, "done", args.source, utc_today(), now_ts, None, None,
+         args.goal, args.outcome, json.dumps(args.constraints or []),
+         _check_confidence(args.confidence), args.verify, args.unknowns, now_ts))
+    for sid in ids:
+        con.execute("UPDATE record SET consolidated_into=? WHERE id=?", (rid, sid))
+        _bump_edge(con, rid, sid, MANUAL_LINK_FLOOR, "manual", now_ts)
+    log_event(con, args.agent or DEFAULT_AGENT, "consolidate", rid,
+              f"{args.text} (folded {len(ids)})")
+    con.commit()
+    con.close()
+    print(f"consolidated {len(ids)} record(s) into {kind} {rid} "
+          f"[{args.agent or DEFAULT_AGENT}]: {args.text}")
 
 
 def cmd_compact(root, args):
@@ -1015,8 +1237,11 @@ def _query_hits(con, terms, agent, limit=10):
         return []
     bm25 = dict(ranked)
     by_id = _fetch_records(con, list(bm25))
-    # dropped records were retired on purpose — keep them out of query results
-    cand = [i for i in bm25 if i in by_id and by_id[i][8] != "dropped"]
+    # dropped records were retired on purpose; consolidated atoms were folded under an
+    # insight — both are held out of the *primary* hits. A consolidated atom can still
+    # surface one hop behind its summary via spreading activation (the `extra` set).
+    folded = _consolidated_ids(con, list(bm25))
+    cand = [i for i in bm25 if i in by_id and by_id[i][8] != "dropped" and i not in folded]
     if not cand:
         return []
     text_ids = set(cand)
@@ -1068,7 +1293,7 @@ def _recent_hits(con, agent, limit=RECENT_DEFAULT):
     pool = max(limit * 3, 30)
     rows = con.execute(
         f"SELECT {RECALL_COLS},recorded_at FROM record "
-        f"WHERE COALESCE(status,'') != 'dropped'{clause} "
+        f"WHERE COALESCE(status,'') != 'dropped' AND COALESCE(consolidated_into,'') = ''{clause} "
         "ORDER BY recorded_at DESC LIMIT ?",
         (*a, pool)).fetchall()
     if not rows:
@@ -1519,6 +1744,28 @@ def build_parser():
                      help="overwrite source instead of appending to the existing trail")
     rcf.add_argument("--verify", help="rewrite the remaining verify path; pass an empty string to clear it")
 
+    sub.add_parser("dream", help="surface dense clusters to consolidate + persona material (read-only)")
+
+    co = sub.add_parser("consolidate", help="fold a cluster of atoms into a higher-altitude insight")
+    co.add_argument("--from", dest="from_ids", nargs="+", required=True,
+                    help="two or more record ids to fold into the insight")
+    co.add_argument("--text", required=True, help="the synthesised summary")
+    co.add_argument("--kind", default="insight", choices=sorted(RECORD_KINDS),
+                    help="kind of the roll-up (default: insight)")
+    co.add_argument("--type")
+    co.add_argument("--people", nargs="*", help="unioned with the atoms' people")
+    co.add_argument("--tags", nargs="*",
+                    help="major keywords pulled from the originals (see dream's "
+                         "suggested_keywords) so the insight still surfaces on them; "
+                         "unioned with every source atom's own tags")
+    co.add_argument("--source", help="confidence basis: evidence held")
+    co.add_argument("--goal")
+    co.add_argument("--outcome")
+    co.add_argument("--constraints", nargs="*", help="gotchas/limits (each a quoted phrase)")
+    co.add_argument("--confidence", help="high | medium | low")
+    co.add_argument("--verify", help="confidence basis: available evidence + how to get it")
+    co.add_argument("--unknowns", help="confidence basis: what remains unknown")
+
     sub.add_parser("agents", help="list agents that have touched memory, with counts")
 
     v = sub.add_parser("validate", help="validate memory.json")
@@ -1538,6 +1785,7 @@ DISPATCH = {
     "render": cmd_render, "export": cmd_export,
     "link": cmd_link, "unlink": cmd_unlink, "links": cmd_links,
     "reinforce": cmd_reinforce, "forget": cmd_forget, "reconfirm": cmd_reconfirm,
+    "dream": cmd_dream, "consolidate": cmd_consolidate,
 }
 
 
@@ -1546,7 +1794,7 @@ DISPATCH = {
 # (--tags a,b) — normalize both forms to a clean list of distinct tokens.
 # Short-token fields where comma-splitting is helpful. constraints is intentionally
 # excluded: each gotcha is a phrase that may itself contain a comma.
-_MULTI_FIELDS = ("people", "tags", "query", "focus_areas", "archive", "drop")
+_MULTI_FIELDS = ("people", "tags", "query", "focus_areas", "archive", "drop", "from_ids")
 
 
 def _split_multi(values):

@@ -132,6 +132,24 @@ It folds the new evidence into `source` (appended to the existing trail, or `--r
 
 **Use it or lose it:** any reactivation — a `recall`/`brief` that surfaces it (reinforce is the default), an explicit `reinforce`, or a `link` — resets a record's `last_used`, and a strongly-wired record is spared even when dormant. So frequently-recalled and well-connected memories survive; truly forgotten ones surface for cleanup.
 
+## Dream (consolidate & re-synthesise)
+
+Where `scan` is the janitor that *prunes*, **`dream` is the consolidator that *integrates*** — memory's version of sleep. Run it occasionally at save time (after `scan`), when the store has grown enough that clusters have formed. Two movements:
+
+**1. Roll up a cluster into an `insight`.** `python3 scripts/memory.py dream` (optionally `--agent <slug>`) returns `clusters` — dense neighbourhoods of records the graph has wired together — each with its members. When a cluster is a coherent topic that's essentially closed out, *reason a summary of it* and fold it:
+
+```
+consolidate --agent <slug> --from <id> <id> <id> --text "<the synthesised insight>" [--tags ... --confidence ... --goal ... --outcome ... --constraints ...]
+```
+
+This writes a new `insight` (the highest-ranked kind), links it to each source atom, and marks those atoms **consolidated** — held out of primary recall but kept as evidence, surfacing one hop behind the summary (`"why": "linked to a match"`). So later recall leads with the synthesis and the atoms are its trail back to ground truth. Consolidate only what's *settled* — a live, still-changing cluster should stay as atoms. Don't fold across unrelated subjects just because they're linked; read the members and confirm they're one thing.
+
+**Carry the keywords across so the topic still comes up.** A folded atom is no longer a primary hit on *its own* words, so the insight has to inherit them. It automatically keeps the union of the atoms' `tags`/`people`; on top of that, **pull the major keywords out of the folded memories and pass them as `--tags`** — `dream` hands you a `suggested_keywords` list per cluster (the members' tags plus the salient words from their text, e.g. `terse`, `async`, `dark`), so lift the ones that matter, including any that lived only in an atom's prose. Tags are weighted well above free text in recall, so a good keyword set means a query like `"terse"` still lands on the consolidated insight.
+
+**2. Re-synthesise the persona.** `dream`'s `persona` block returns the current profile plus the newest high-confidence `fact`s. When the facts have drifted ahead of the profile, reason a fresh profile and write it with `profile --name/--title/--notes/--focus-areas/--key-people`. The profile is person-level and can contradict what's there, so this is an **ask-first** write — show the user the proposed profile before saving.
+
+`dream` itself writes nothing; it only surfaces the material. Nothing is folded or rewritten until you run `consolidate`/`profile`, so treat a dream pass like `scan`: propose a short list, get a yes, then act.
+
 ## Filtering by agent
 
 `--agent <slug>` filters reads and scopes recall, scan, export, and render. The `agents` verb lists every agent that has touched memory with active and long-term counts. Omit `--agent` on a read to see the whole landscape.
