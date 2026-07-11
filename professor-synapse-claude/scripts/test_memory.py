@@ -793,6 +793,43 @@ class Dream(MemTest):
         self.assertEqual(len(actions), 1)
         self.assertIn("folded 3", actions[0]["summary"])
 
+    def test_dream_suggests_keywords_from_members(self):
+        a, b, c = self.cluster_of_three()
+        cluster = self.cli_json("dream")["clusters"][0]
+        kws = cluster["suggested_keywords"]
+        # curated tags are always kept, and distinctive text words are pulled in
+        for t in ("ui", "style", "comms"):
+            self.assertIn(t, kws)
+        self.assertIn("terse", kws, "a distinctive text-only word is suggested")
+        self.assertNotIn("prefers", kws, "stopwords are filtered out")
+
+    def test_consolidate_inherits_source_tags_and_people(self):
+        a = self.rec("alice owns billing", tags="finance", people="Alice")
+        b = self.rec("alice approves invoices", tags="approvals", people="Alice")
+        c = self.rec("billing runs monthly", tags="cadence")
+        self.cli("reinforce", "--ids", a, b, c)
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c,
+                 "--text", "Alice owns the monthly billing/approvals flow", "--tags", "billing")
+        rec = [r for r in self.cli_json("export")["record"] if r["kind"] == "insight"][0]
+        # agent-supplied keyword first, then the union of the atoms' tags
+        self.assertEqual(rec["tags"], '["billing", "finance", "approvals", "cadence"]')
+        self.assertEqual(rec["people"], '["Alice"]', "people are unioned and de-duplicated")
+
+    def test_keyword_tag_resurfaces_folded_topic(self):
+        # The agent pulls a text-only keyword ('async') from an atom and tags the insight
+        # with it, so the folded topic still surfaces — the summary, as a primary hit.
+        a = self.rec("user prefers dark mode", tags="ui")
+        b = self.rec("user prefers async communication", tags="comms")
+        c = self.rec("user prefers short replies", tags="style")
+        self.cli("reinforce", "--ids", a, b, c)
+        self.cli("--agent", "a", "consolidate", "--from", a, b, c,
+                 "--text", "user UX preferences", "--tags", "async")
+        hits = self.cli_json("recall", "--query", "async", "--no-reinforce")["candidates"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["kind"], "insight")
+        self.assertEqual(hits[0]["why"], "matches async",
+                         "an inherited/added keyword makes the folded topic a primary hit")
+
     def test_consolidate_survives_doctor(self):
         a, b, c = self.cluster_of_three()
         self.cli("--agent", "a", "consolidate", "--from", a, b, c, "--text", "rolled up")

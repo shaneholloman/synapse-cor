@@ -706,6 +706,47 @@ def cmd_scan(root, args):
                       "stale_longterm": stale_lt, "unverified": unverified}, indent=2))
 
 
+# Compact English stopword set for keyword suggestion (dream). Not exhaustive — just
+# enough to keep suggested keywords substantive; the agent curates the final set.
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
+    "with", "at", "by", "from", "as", "is", "are", "was", "were", "be", "been", "being",
+    "it", "its", "this", "that", "these", "those", "i", "you", "he", "she", "they", "we",
+    "them", "his", "her", "their", "our", "your", "my", "me", "us", "do", "does", "did",
+    "done", "so", "not", "no", "yes", "can", "will", "would", "should", "could", "may",
+    "might", "must", "have", "has", "had", "about", "into", "over", "than", "too", "very",
+    "just", "also", "more", "most", "some", "any", "all", "each", "who", "what", "when",
+    "where", "which", "how", "user", "users", "prefers", "prefer", "preferred",
+}
+
+
+def _suggest_keywords(members, limit=12):
+    """Pull salient keywords from a cluster's members (their tags + text + constraints)
+    to seed an `insight`'s recall tags, so the folded topics still surface on their own
+    words. Existing tags are always kept (already-curated recall keys); the rest are the
+    most frequent stopword-filtered words across the members. A starting point for the
+    agent to curate — not an authority."""
+    from collections import Counter
+    counts = Counter()
+    kept = []  # curated tags, kept regardless of frequency
+    for m in members:
+        for t in (m.get("tags") or []):
+            tl = t.strip().lower()
+            if tl and tl not in kept:
+                kept.append(tl)
+        blob = " ".join([m.get("text") or ""] + list(m.get("constraints") or []))
+        for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", blob.lower()):
+            if w not in _STOPWORDS:
+                counts[w] += 1
+    out = list(kept)
+    for w, _n in counts.most_common():
+        if len(out) >= limit:
+            break
+        if w not in out:
+            out.append(w)
+    return out[:limit]
+
+
 def _clusters(con, agent=None, now=None):
     """Dense neighbourhoods in the co-recall graph worth rolling up into an `insight`.
     Union-find over edges whose decayed weight clears DREAM_EDGE_FLOOR, restricted to
@@ -716,11 +757,12 @@ def _clusters(con, agent=None, now=None):
     clause = " AND agent = ?" if agent else ""
     a = (agent,) if agent else ()
     eligible = {}
-    for rid, ag, kind, text, tags, conf in con.execute(
-        "SELECT id,agent,kind,text,tags,confidence FROM record "
+    for rid, ag, kind, text, tags, conf, constraints in con.execute(
+        "SELECT id,agent,kind,text,tags,confidence,constraints FROM record "
         f"WHERE status != 'dropped' AND COALESCE(consolidated_into,'') = ''{clause}", a):
         eligible[rid] = {"id": rid, "agent": ag, "kind": kind, "text": text,
-                         "tags": _json_list(tags), "confidence": conf}
+                         "tags": _json_list(tags), "confidence": conf,
+                         "constraints": _json_list(constraints)}
     parent = {}
 
     def find(x):
@@ -753,8 +795,10 @@ def _clusters(con, agent=None, now=None):
     for root, ids in groups.items():
         if len(ids) < DREAM_MIN_CLUSTER:
             continue
+        members = [eligible[i] for i in ids]
         out.append({"size": len(ids), "density": round(density.get(root, 0.0), 4),
-                    "members": [eligible[i] for i in ids]})
+                    "suggested_keywords": _suggest_keywords(members),
+                    "members": members})
     out.sort(key=lambda c: c["density"], reverse=True)
     return out[:DREAM_MAX_CLUSTERS]
 
@@ -796,7 +840,9 @@ def cmd_consolidate(root, args):
     roll-up). Creates the insight, links it to each source atom so they stay reachable
     one hop behind it, and marks the atoms consolidated — held out of primary recall
     but kept as evidence. The summary becomes the hot recall hit; the atoms are its
-    trail back to the ground truth."""
+    trail back to the ground truth. The insight inherits the union of the atoms' tags
+    and people (plus any keywords passed via --tags) so the folded topics still surface
+    on their own words."""
     kind = args.kind or "insight"
     if kind not in RECORD_KINDS:
         sys.exit(f"--kind must be one of {sorted(RECORD_KINDS)}")
@@ -804,9 +850,14 @@ def cmd_consolidate(root, args):
     if len(ids) < 2:
         sys.exit("--from needs at least two record ids to consolidate")
     con = connect_db(root)
+    # Inherit the atoms' curated recall keys so the folded topics still surface: the
+    # insight's tags/people are the agent-supplied ones (major keywords pulled from the
+    # originals — dream suggests them) plus the union of every source atom's tags/people.
+    inherited_tags, inherited_people = [], []
     for sid in ids:
         row = con.execute(
-            "SELECT status, consolidated_into FROM record WHERE id=?", (sid,)).fetchone()
+            "SELECT status, consolidated_into, tags, people FROM record WHERE id=?",
+            (sid,)).fetchone()
         if row is None:
             con.close()
             sys.exit(f"unknown record id: {sid}")
@@ -816,6 +867,14 @@ def cmd_consolidate(root, args):
         if row[1]:
             con.close()
             sys.exit(f"record {sid} is already consolidated (into {row[1]})")
+        for t in _json_list(row[2]):
+            if t not in inherited_tags:
+                inherited_tags.append(t)
+        for p in _json_list(row[3]):
+            if p not in inherited_people:
+                inherited_people.append(p)
+    final_tags = list(dict.fromkeys((args.tags or []) + inherited_tags))
+    final_people = list(dict.fromkeys((args.people or []) + inherited_people))
     rid = new_id()
     now_ts = utc_now()
     con.execute(
@@ -824,7 +883,7 @@ def cmd_consolidate(root, args):
         "recorded_at,reason,rationale,goal,outcome,constraints,confidence,verify,unknowns,last_used)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rid, args.agent or DEFAULT_AGENT, kind, args.type, args.text,
-         json.dumps(args.people or []), json.dumps(args.tags or []),
+         json.dumps(final_people), json.dumps(final_tags),
          None, None, "done", args.source, utc_today(), now_ts, None, None,
          args.goal, args.outcome, json.dumps(args.constraints or []),
          _check_confidence(args.confidence), args.verify, args.unknowns, now_ts))
@@ -1694,8 +1753,11 @@ def build_parser():
     co.add_argument("--kind", default="insight", choices=sorted(RECORD_KINDS),
                     help="kind of the roll-up (default: insight)")
     co.add_argument("--type")
-    co.add_argument("--people", nargs="*")
-    co.add_argument("--tags", nargs="*")
+    co.add_argument("--people", nargs="*", help="unioned with the atoms' people")
+    co.add_argument("--tags", nargs="*",
+                    help="major keywords pulled from the originals (see dream's "
+                         "suggested_keywords) so the insight still surfaces on them; "
+                         "unioned with every source atom's own tags")
     co.add_argument("--source", help="confidence basis: evidence held")
     co.add_argument("--goal")
     co.add_argument("--outcome")
